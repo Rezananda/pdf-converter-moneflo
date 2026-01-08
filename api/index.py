@@ -52,7 +52,8 @@ async def convert_pdf_to_text(
             "page_count": len(doc),
             "is_encrypted": doc.is_encrypted,
             "text_preview": text_output[:100] + "...", 
-            "full_text": text_output
+            "full_text": text_output,
+            "metadata": doc.metadata
         }
 
     except HTTPException as http_exc:
