@@ -1,7 +1,42 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 import fitz  # PyMuPDF
+from api.parsers import parse_bank_statement
+import os
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Load env vars from .env file if present
+load_dotenv()
 
 app = FastAPI()
+
+# Supabase Client
+url: str = os.environ.get("SUPABASE_URL")
+key: str = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(url, key) if url and key else None
+
+
+async def verify_token(authorization: str = Header(...)):
+    if not supabase:
+        # If supabase is not configured, strictly speaking we should probably fail safe
+        # But for dev maybe we log a warning?
+        # User requirement says: "if not valid then throw error".
+        # If env vars missing => we can't validate => fail.
+        raise HTTPException(status_code=500, detail="Server authentication not configured")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    
+    token = authorization.split(" ")[1]
+    
+    try:
+        user = supabase.auth.get_user(token)
+        if not user:
+             raise HTTPException(status_code=401, detail="user unauthorized")
+        return user
+    except Exception as e:
+        # Supabase raises exception on invalid token
+        raise HTTPException(status_code=401, detail="user unauthorized")
 
 @app.get("/")
 def home():
@@ -10,7 +45,8 @@ def home():
 @app.post("/api/convert")
 async def convert_pdf_to_text(
     file: UploadFile = File(...), 
-    password: str = Form(None) # 1. Accept optional password field
+    password: str = Form(None), # 1. Accept optional password field
+    user: dict = Depends(verify_token) # 2. Validate token
 ):
     # Validate file type
     if file.content_type != "application/pdf":
@@ -47,14 +83,14 @@ async def convert_pdf_to_text(
         for page in doc:
             text_output += page.get_text() + "\n"
             
-        return {
-            "filename": file.filename,
-            "page_count": len(doc),
-            "is_encrypted": doc.is_encrypted,
-            "text_preview": text_output[:100] + "...", 
-            "full_text": text_output,
-            "metadata": doc.metadata
-        }
+        # Parse Bank Statement
+        try:
+            # We pass text_output and metadata to the parser
+            transactions = parse_bank_statement(text_output, doc.metadata)
+            return transactions
+        except ValueError as e:
+            # "Bank Not Supported" error
+            raise HTTPException(status_code=400, detail=str(e))
 
     except HTTPException as http_exc:
         # Re-raise custom HTTP exceptions (like 400 or 401)
