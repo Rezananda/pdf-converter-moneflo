@@ -11,12 +11,26 @@ load_dotenv()
 app = FastAPI()
 
 # Supabase Client
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
-supabase: Client = create_client(url, key) if url and key else None
+# url: str = os.environ.get("SUPABASE_URL")
+# key: str = os.environ.get("SUPABASE_KEY")
+# supabase: Client = create_client(url, key) if url and key else None
 
+def get_supabase() -> Client:
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
 
-async def verify_token(authorization: str = Header(...)):
+    if not url or not key:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase environment variables not configured"
+        )
+
+    return create_client(url, key)
+
+async def verify_token(
+    authorization: str = Header(...),
+    supabase: Client = Depends(get_supabase)
+):
     if not supabase:
         # If supabase is not configured, strictly speaking we should probably fail safe
         # But for dev maybe we log a warning?
@@ -42,7 +56,7 @@ async def verify_token(authorization: str = Header(...)):
 def home():
     return {"message": "PDF Converter API is Running!"}
 
-@app.post("/api/convert")
+@app.post("/api/v1/convert")
 async def convert_pdf_to_text(
     file: UploadFile = File(...), 
     password: str = Form(None), # 1. Accept optional password field
