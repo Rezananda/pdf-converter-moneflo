@@ -107,13 +107,14 @@ async def convert_pdf_to_text(
         
         # Extract text
         for page in doc:
-            text_output += page.get_text() + "\n"
+            # sort=True attempts to order text by physical position (reading order)
+            text_output += page.get_text("text", sort=True) + "\n"
             
         # Parse Bank Statement
         try:
-            # We pass text_output and metadata to the parser
-            transactions = parse_bank_statement(text_output, doc.metadata)
-            return transactions
+            # We pass text_output, metadata, and filename to the parser
+            result = parse_bank_statement(text_output, doc.metadata, file.filename)
+            return result
         except ValueError as e:
             # "Bank Not Supported" error
             raise HTTPException(status_code=400, detail=str(e))
@@ -122,4 +123,5 @@ async def convert_pdf_to_text(
         # Re-raise custom HTTP exceptions (like 400 or 401)
         raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {repr(e)}")
