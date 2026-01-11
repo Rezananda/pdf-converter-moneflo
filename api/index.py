@@ -15,6 +15,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",  # local dev
+        "https://moneflo.netlify.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
