@@ -100,8 +100,8 @@ async def convert_pdf_to_text(
             if not doc.authenticate(password):
                  # Case: PDF is locked, but WRONG password was sent
                 raise HTTPException(
-                    status_code=401, 
-                    detail="Incorrect password provided."
+                    status_code=400, 
+                    detail="incorrect password, please retry again"
                 )
 
         text_output = ""
