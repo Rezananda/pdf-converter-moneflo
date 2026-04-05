@@ -1,80 +1,727 @@
 import re
+import traceback
 from datetime import datetime
 
-def parse_bank_statement(text: str, metadata: dict, filename: str = "") -> dict:
-    creator = metadata.get("creator", "")
-    print(f"DEBUG: parse_bank_statement called. Creator: '{creator}'")
-    
-    result = {}
-    
-    # Priority 1: Metadata Signature
-    if "Bank Mandiri" in creator:
-        return parse_mandiri(text)
-    if "E-statement Batch Generator" in creator or "BCA" in creator.upper():
-        return parse_bca(text)
-    if "BNI" in creator.upper() or "Bank Negara Indonesia" in creator:
-        return parse_bni(text)
-    if "bluAccount" in text or "BCA Digital" in text or "bluSaving" in text:
-        return parse_blu(text)
-        
-    # Priority 2: Specific Content Signature
-    if "Tabungan NOW" in text or "Bank Mandiri" in text or "Mandiri Call" in text:
-        return parse_mandiri(text)
-        
-    if "MUTASI REKENING" in text and "BCA" in text:
-        return parse_bca(text)
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if "TAPLUS" in text and "BNI" in text:
-        return parse_bni(text)
-        
-    # Fallback
-    if "mandiri" in text.lower():
-        return parse_mandiri(text)
-    if "BCA" in text: # Weak fallback
-        return parse_bca(text)
+MONTH_MAP = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "mei": "05",
+    "jun": "06", "jul": "07", "aug": "08", "agu": "08", "sep": "09",
+    "oct": "10", "okt": "10", "nov": "11", "dec": "12", "des": "12",
+    "januari": "01", "februari": "02", "maret": "03", "april": "04",
+    "juni": "06", "juli": "07", "agustus": "08", "september": "09",
+    "oktober": "10", "november": "11", "desember": "12",
+    "january": "01", "march": "03", "june": "06", "july": "07",
+    "august": "08", "september": "09", "october": "10", "november": "11",
+    "december": "12"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_bank_statement(text: str) -> bool:
+    """Smart validation: checks if this PDF text looks like a bank statement."""
+    bank_keywords = [
+        r"saldo", r"mutasi", r"rekening", r"keterangan", r"nominal",
+        r"debit", r"credit", r"transaction", r"pemasukan", r"pengeluaran",
+        r"amount", r"balance", r"statement", r"history", r"transfer",
+        r"tabungan", r"account", r"savings", r"kantong", r"pockets"
+    ]
+    matches = sum(1 for kw in bank_keywords if re.search(kw, text, re.IGNORECASE))
+    date_pattern = r"\d{1,2}[/\-\s]([A-Za-z]{3,}|\d{1,2})[/\-\s]?\d{0,4}"
+    has_dates = len(re.findall(date_pattern, text)) > 2
+    currency_pattern = r"\d{1,3}(?:[.,]\d{3})+[.,]\d{2}"
+    has_currency = len(re.findall(currency_pattern, text)) > 3
+    return matches >= 3 or (matches >= 2 and has_dates) or (has_dates and has_currency)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANK SIGNATURE DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_bank(text: str, metadata: dict) -> str:
+    """Auto-detect the bank from metadata and text content."""
+    creator = metadata.get("creator", "") if metadata else ""
     
-    raise ValueError("Bank Not Supported")
+    # Metadata signatures (most reliable)
+    if "Bank Mandiri" in creator:
+        return "MANDIRI"
+    if "E-statement Batch Generator" in creator or "BCA" in creator.upper():
+        return "BCA"
+    if "BNI" in creator.upper() or "Bank Negara Indonesia" in creator:
+        return "BNI"
+    
+    # Content signatures (ordered by specificity — Jago MUST come before BLU)
+    # because Jago statements often mention "BCA Digital" as a transfer source.
+    if "Pockets Transactions History" in text or "Kantong Utama" in text:
+        return "JAGO"
+    if "bluAccount" in text or "bluSaving" in text:
+        return "BLU"
+    if "PT BANK SEABANK INDONESIA" in text.upper() or "www.seabank.co.id" in text:
+        return "SEABANK"
+    if "Tabungan NOW" in text or "Mandiri Call" in text or ("Bank Mandiri" in text and "Dana Masuk" in text):
+        return "MANDIRI"
+    if "MUTASI REKENING" in text and "BCA" in text:
+        return "BCA"
+    if ("TAPLUS" in text or "BNI" in text) and "Negara Indonesia" in text:
+        return "BNI"
+    if "e-Statement" in text and ("Tabungan" in text or "Semangat" in text):
+        return "MANDIRI"
+    
+    return "UNKNOWN"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANK ROUTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_bank_statement(text: str, metadata: dict, filename: str = "") -> dict:
+    bank = detect_bank(text, metadata)
+    print(f"DEBUG: Detected bank = '{bank}' for file '{filename}'")
+    
+    if bank == "MANDIRI":
+        return parse_mandiri(text)
+    if bank == "BCA":
+        return parse_bca(text)
+    elif bank == "BNI":
+        return parse_bni(text)
+    elif bank == "BLU":
+        return parse_blu(text)
+    elif bank == "JAGO":
+        return parse_jago(text)
+    elif bank == "SEABANK":
+        return parse_seabank(text)
+    else:
+        print("DEBUG: Unknown bank. Using Smart Adaptive Parser.")
+        return parse_smart(text, metadata)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JAGO PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_jago(text: str) -> dict:
+    """
+    Parser for Bank Jago statements.
+    Layout: DD MMM YYYY  Source/Dest  Description  Note  +/-Amount  Balance
+    HH.MM is on a second sub-line.
+    Dates are grouped under month headers like 'Januari 2026'.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    period_val = ""
+    initial_balance = 0.0
+    closing_balance = 0.0
+    incoming_total = 0.0
+    outgoing_total = 0.0
+    transactions = []
+    current_year = str(datetime.now().year)
+
+    # Detect period from header
+    # "Menampilkan transaksi IDR dari 23 Jan 2026 - 05 Apr 2026"
+    period_match = re.search(
+        r"dari\s+(\d{1,2}\s+\w+\s+\d{4})\s*[-–]\s*(\d{1,2}\s+\w+\s+\d{4})",
+        text, re.IGNORECASE
+    )
+    if period_match:
+        period_val = f"{period_match.group(1)} - {period_match.group(2)}"
+        yr = re.search(r"(\d{4})", period_match.group(2))
+        if yr:
+            current_year = yr.group(1)
+
+    # Detect closing balance from "Saldo terbaru ... IDR 408.773"
+    closing_match = re.search(r"IDR\s+([\d.,]+)", text)
+    if closing_match:
+        closing_balance = clean_amount(closing_match.group(1))
+
+    # Current month context (tracks 'Januari 2026' headers)
+    current_month = "01"
+    current_year_ctx = current_year
+
+    # Transaction pattern: "DD MMM YYYY  Source  Description    Note    +/-Amount  Balance"
+    # Amount uses Indonesian format: 500.000,00 or 100.000.000
+    # Some amounts have no decimal: 82 or -500.000
+
+    tx_date_pattern = re.compile(
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|Mei|Jun|Jul|Agu|Sep|Okt|Nov|Des|"
+        r"Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember|"
+        r"January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})",
+        re.IGNORECASE
+    )
+    month_header_pattern = re.compile(
+        r"^(Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember|"
+        r"January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$",
+        re.IGNORECASE
+    )
+    currency_pattern = re.compile(r"([+-]?\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+)")
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check for month header (e.g., "Januari 2026")
+        mhdr = month_header_pattern.match(line)
+        if mhdr:
+            current_month = MONTH_MAP.get(mhdr.group(1).lower(), "01")
+            current_year_ctx = mhdr.group(2)
+            i += 1
+            continue
+
+        # Check for transaction date row
+        tx_match = tx_date_pattern.match(line)
+        if tx_match:
+            day = tx_match.group(1).zfill(2)
+            month_str = tx_match.group(2).lower()[:3]
+            year = tx_match.group(3)
+            month = MONTH_MAP.get(month_str, current_month)
+            tx_date = f"{year}-{month}-{day}"
+
+            # Everything after the date on this line is potentially source/desc/amount/balance
+            remaining = line[tx_match.end():].strip()
+
+            # Extract all currency-looking numbers from this line
+            # Jago amounts: "+500.000,00" or "-100.000.000" or "+82"
+            amounts_in_line = re.findall(
+                r"([+-]\s*\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|[+-]\d+)",
+                remaining
+            )
+            balances_in_line = re.findall(
+                r"(?<![+-])\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\b",
+                remaining
+            )
+
+            # Build description from non-numeric parts
+            desc_part = re.sub(
+                r"[+-]?\s*\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?", "", remaining
+            ).strip()
+            desc_part = re.sub(r"\s+", " ", desc_part).strip()
+
+            # Get next line (often the time + extra detail)
+            if i + 1 < len(lines) and re.match(r"^\d{2}\.\d{2}", lines[i+1]):
+                time_line = lines[i + 1]
+                extra = re.sub(r"^\d{2}\.\d{2}\s*", "", time_line).strip()
+                if extra:
+                    desc_part = (desc_part + " " + extra).strip()
+                i += 1  # consume time line
+
+            # Determine amount and type
+            amount = 0.0
+            amount_type = "credit"
+            balance = 0.0
+
+            if amounts_in_line:
+                raw_amt = amounts_in_line[0].replace(" ", "")
+                amount = abs(clean_amount(raw_amt))
+                amount_type = "debit" if "-" in raw_amt else "credit"
+
+            if balances_in_line:
+                balance = clean_amount(balances_in_line[-1])
+
+            # Accumulate totals
+            if amount_type == "credit":
+                incoming_total += amount
+            else:
+                outgoing_total += amount
+
+            transactions.append({
+                "transaction_date": tx_date,
+                "transaction_description": desc_part,
+                "transaction_amount": amount,
+                "amount_type": amount_type,
+                "transaction_bank": "JAGO",
+                "transaction_balance": balance
+            })
+
+        i += 1
+
+    if transactions:
+        closing_balance = transactions[-1]["transaction_balance"] or closing_balance
+
+    return {
+        "period": period_val,
+        "initial_balance": initial_balance,
+        "closing_balance": closing_balance,
+        "incoming_transactions": incoming_total,
+        "outgoing_transactions": outgoing_total,
+        "transactions": transactions
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEABANK PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_seabank(text: str) -> dict:
+    """
+    Parser for SeaBank statements.
+    After sort=True, transaction rows look like:
+      "02 JUN                 124.192"   (date + amount on same line)
+      "Shopee"                           (description on next line)
+      "Payment"                          (description type on next line)
+    Or for incoming:
+      "02 JUN                             184.277"
+      "Ni Luh Gede Sri Fajaryani"
+      "Transfer"
+    """
+    # Use raw lines (strip only leading/trailing whitespace, keep internal spacing)
+    raw_lines = [l.rstrip() for l in text.split("\n")]
+    lines = [l.strip() for l in raw_lines if l.strip()]
+
+    period_val = ""
+    initial_balance = 0.0
+    closing_balance = 0.0
+    incoming_total = 0.0
+    outgoing_total = 0.0
+    transactions = []
+
+    # Detect year
+    year_match = re.search(r"\b(20\d{2})\b", text)
+    current_year = year_match.group(1) if year_match else str(datetime.now().year)
+
+    # Detect period
+    period_match = re.search(
+        r"(\d{1,2}\s+\w{3,}\s+\d{4})\s+(?:to|-)\s+(\d{1,2}\s+\w{3,}\s+\d{4})",
+        text, re.IGNORECASE
+    )
+    if period_match:
+        period_val = f"{period_match.group(1)} - {period_match.group(2)}"
+        current_year = re.search(r"\d{4}", period_match.group(1)).group(0)
+
+    # Summary from raw text: "SAVINGS  20.152.067  13.076.837  111.836.081  118.911.311"
+    summary_match = re.search(
+        r"SAVINGS\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)", text
+    )
+    if summary_match:
+        initial_balance = clean_amount(summary_match.group(1))
+        outgoing_total = clean_amount(summary_match.group(2))
+        incoming_total = clean_amount(summary_match.group(3))
+        closing_balance = clean_amount(summary_match.group(4))
+
+    # Transaction row pattern (on the same stripped line):
+    # "DD MMM  [whitespace]  AMOUNT"
+    # Seabank uses two columns: OUTGOING at ~col 50, INCOMING at ~col 70+
+    # We detect amounts on the date line by looking at the raw (unstripped) line
+    
+    # We'll process raw_lines to preserve column positions for amount classification
+    date_line_re = re.compile(
+        r"^\s{0,8}(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)",
+        re.IGNORECASE
+    )
+    month_line_re = re.compile(
+        r"^\s{0,8}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*$",
+        re.IGNORECASE
+    )
+    
+    skip_keywords = {
+        "DATE", "TRANSACTION", "OUTGOING (IDR)", "INCOMING (IDR)",
+        "SAVINGS - TRANSACTION DETAILS", "ACCOUNT SUMMARY",
+        "STARTING BALANCE (IDR)", "TOTAL OUTGOING (IDR)",
+        "TOTAL INCOMING (IDR)", "ENDING BALANCE (IDR)", "TOTAL:",
+        "SAVINGS", "ACCOUNT", "S/N", "BANK STATEMENT"
+    }
+    
+    i = 0
+    while i < len(raw_lines):
+        raw_line = raw_lines[i]
+        stripped = raw_line.strip()
+        
+        # Skip header/footer lines
+        if stripped.upper() in skip_keywords or re.match(r"^TOTAL:", stripped, re.IGNORECASE):
+            i += 1
+            continue
+        
+        m_date = date_line_re.match(raw_line)
+        m_month = month_line_re.match(raw_line)
+        
+        if m_date:
+            day = m_date.group(1).zfill(2)
+            month = MONTH_MAP.get(m_date.group(2).lower(), "01")
+            tx_date = f"{current_year}-{month}-{day}"
+            
+            # Extract amounts from THIS line (after the date part)
+            # The column position determines if it's outgoing or incoming
+            # Approx: outgoing is left-center, incoming is right
+            after_date = raw_line[m_date.end():]
+            
+            # Find all amounts on this line
+            amounts_found = list(re.finditer(r"([\d.,]+)", after_date))
+            
+            amount = 0.0
+            amount_type = "credit"
+            
+            if amounts_found:
+                # Use position on line as proxy for outgoing vs incoming column
+                # The line is typically 80-100 chars wide
+                # Outgoing: position < 60% of line length (left column)
+                # Incoming: position > 60% of line length (right column)
+                line_len = len(raw_line)
+                for am in amounts_found:
+                    abs_pos = m_date.end() + am.start()
+                    val = clean_amount(am.group(1))
+                    if val > 0:
+                        amount = val
+                        # Determine if outgoing or incoming based on column position
+                        relative_pos = abs_pos / max(line_len, 1)
+                        if relative_pos < 0.65:
+                            # Left column = OUTGOING
+                            amount_type = "debit"
+                        else:
+                            # Right column = INCOMING
+                            amount_type = "credit"
+                        break
+            
+            # Collect description from nearby lines
+            desc_lines = []
+            j = i + 1
+            while j < len(raw_lines) and j < i + 5:
+                nxt_raw = raw_lines[j]
+                nxt = nxt_raw.strip()
+                
+                if not nxt:
+                    j += 1
+                    continue
+                if date_line_re.match(nxt_raw) or month_line_re.match(nxt_raw):
+                    break
+                if nxt.upper() in skip_keywords:
+                    j += 1
+                    continue
+                # Skip if it's a pure number line (another amount)
+                if re.match(r"^[\d.,]+$", nxt):
+                    j += 1
+                    continue
+                # Skip if line starts with a number pattern like "01 JUL 2024"
+                if re.match(r"^\d{1,2}\s+[A-Z]{3}\s+\d{4}", nxt, re.IGNORECASE):
+                    break
+                desc_lines.append(nxt)
+                j += 1
+            
+            desc = " ".join(desc_lines).strip()
+            desc = re.sub(r"\s+", " ", desc)
+            
+            # Override amount_type from description keywords
+            desc_lower = desc.lower()
+            if any(k in desc_lower for k in ["payment", "tax", "pajak", "withdraw", "fee", "biaya", "bia"]):
+                amount_type = "debit"
+            elif any(k in desc_lower for k in ["interest", "bunga", "transfer from", "dari", "incoming"]):
+                amount_type = "credit"
+            
+            if amount > 0:
+                if amount_type == "credit":
+                    incoming_total += amount
+                else:
+                    outgoing_total += amount
+                
+                transactions.append({
+                    "transaction_date": tx_date,
+                    "transaction_description": desc,
+                    "transaction_amount": amount,
+                    "amount_type": amount_type,
+                    "transaction_bank": "SEABANK",
+                    "transaction_balance": 0.0
+                })
+            
+            i = j
+            continue
+        
+        elif m_month:
+            # Month-only header like "JUN" (for interest without day)
+            month = MONTH_MAP.get(m_month.group(1).lower(), "01")
+            tx_date = f"{current_year}-{month}-01"
+            
+            desc_lines = []
+            amount = 0.0
+            amount_type = "credit"
+            
+            # Look in this same line for amounts
+            after_month = raw_line[m_month.end():]
+            am_match = re.search(r"([\d.,]+)", after_month)
+            if am_match:
+                amount = clean_amount(am_match.group(1))
+                # Same column heuristic
+                abs_pos = m_month.end() + am_match.start()
+                relative_pos = abs_pos / max(len(raw_line), 1)
+                amount_type = "debit" if relative_pos < 0.65 else "credit"
+            
+            j = i + 1
+            while j < len(raw_lines) and j < i + 5:
+                nxt_raw = raw_lines[j]
+                nxt = nxt_raw.strip()
+                if not nxt:
+                    j += 1
+                    continue
+                if date_line_re.match(nxt_raw) or month_line_re.match(nxt_raw):
+                    break
+                if nxt.upper() in skip_keywords:
+                    j += 1
+                    continue
+                if re.match(r"^[\d.,]+$", nxt):
+                    j += 1
+                    continue
+                desc_lines.append(nxt)
+                j += 1
+            
+            desc = " ".join(desc_lines).strip()
+            desc_lower = desc.lower()
+            if any(k in desc_lower for k in ["tax", "pajak", "fee", "biaya"]):
+                amount_type = "debit"
+            elif any(k in desc_lower for k in ["interest", "bunga"]):
+                amount_type = "credit"
+            
+            if amount > 0:
+                if amount_type == "credit":
+                    incoming_total += amount
+                else:
+                    outgoing_total += amount
+                
+                transactions.append({
+                    "transaction_date": tx_date,
+                    "transaction_description": desc,
+                    "transaction_amount": amount,
+                    "amount_type": amount_type,
+                    "transaction_bank": "SEABANK",
+                    "transaction_balance": 0.0
+                })
+            i = j
+            continue
+        
+        i += 1
+
+    return {
+        "period": period_val,
+        "initial_balance": initial_balance,
+        "closing_balance": closing_balance,
+        "incoming_transactions": incoming_total,
+        "outgoing_transactions": outgoing_total,
+        "transactions": transactions
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMART ADAPTIVE PARSER (for truly unknown banks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_smart(text: str, metadata: dict = None) -> dict:
+    """
+    An adaptive, signature-aware parser for bank statements that don't match
+    known specific parsers. Uses header detection and flexible pattern matching.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    
+    period_val = "Unknown (Smart Parsed)"
+    initial_balance = 0.0
+    closing_balance = 0.0
+    incoming_total = 0.0
+    outgoing_total = 0.0
+    transactions = []
+    
+    # Detect year
+    year_match = re.search(r"202[0-9]", text)
+    current_year = year_match.group(0) if year_match else str(datetime.now().year)
+    
+    # Detect period
+    period_match = re.search(
+        r"(Periode|Period|Range|dari|from)\s*[:]?\s*(.{5,60})",
+        text, re.IGNORECASE
+    )
+    if period_match:
+        period_val = period_match.group(2).strip()[:60]
+    
+    # Detect bank name for labeling
+    bank_label = "UNKNOWN"
+    bank_hints = {
+        "BRI": r"BRI|Bank Rakyat Indonesia",
+        "CIMB": r"CIMB|CIMB Niaga",
+        "DANAMON": r"Danamon",
+        "BTN": r"BTN|Bank Tabungan Negara",
+        "OCBC": r"OCBC",
+        "PERMATA": r"PermataBank|Bank Permata",
+    }
+    for b, pat in bank_hints.items():
+        if re.search(pat, text, re.IGNORECASE):
+            bank_label = b
+            break
+    
+    # Detect summary fields
+    for line in lines:
+        if re.search(r"Saldo\s*Awal|Initial\s*Balance|Starting\s*Balance|STARTING BALANCE", line, re.IGNORECASE):
+            m = re.search(r"([\d.,]+)", line)
+            if m:
+                initial_balance = clean_amount(m.group(1))
+        if re.search(r"Saldo\s*Akhir|Closing\s*Balance|Ending\s*Balance|ENDING BALANCE", line, re.IGNORECASE):
+            m = re.search(r"([\d.,]+)(?:\s|$)", line)
+            if m:
+                closing_balance = clean_amount(m.group(1))
+    
+    # Flexible transaction date patterns
+    date_patterns = [
+        # "DD MMM YYYY" or "DD MMM" 
+        re.compile(r"^(\d{1,2})\s+(Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Aug(?:ustus|ust)?|Agu(?:stus)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)\s*(\d{4})?", re.IGNORECASE),
+        # "DD/MM/YYYY" or "DD/MM"
+        re.compile(r"^(\d{2})/(\d{2})(?:/(\d{4}))?"),
+        # "DD-MM-YYYY"
+        re.compile(r"^(\d{2})-(\d{2})-(\d{4})"),
+    ]
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        matched_date = None
+        pattern_type = None
+        for p_idx, pat in enumerate(date_patterns):
+            m = pat.match(line)
+            if m:
+                matched_date = m
+                pattern_type = p_idx
+                break
+        
+        if matched_date:
+            day = matched_date.group(1).zfill(2)
+            month_raw = matched_date.group(2)
+            year = matched_date.group(3) if matched_date.lastindex >= 3 and matched_date.group(3) else current_year
+            
+            if month_raw.isdigit():
+                month = month_raw.zfill(2)
+            else:
+                month = MONTH_MAP.get(month_raw.lower()[:3], "01")
+            
+            tx_date = f"{year}-{month}-{day}"
+            
+            # Extract amounts from the date line
+            currency_vals = re.findall(
+                r"([+-]?\s*\d{1,3}(?:[.,]\d{3})*[.,]\d{2})", line
+            )
+            
+            # Description: everything after the date, before amounts
+            remaining = line[matched_date.end():].strip()
+            desc = remaining
+            for v in currency_vals:
+                desc = desc.replace(v, "")
+            desc = re.sub(r"\s+", " ", desc).strip()
+            
+            # If description is empty, collect from next lines
+            j = i + 1
+            while j < len(lines) and j < i + 4:
+                nxt = lines[j]
+                # Stop if next line looks like a new date
+                if any(pat.match(nxt) for pat in date_patterns):
+                    break
+                # Stop if next line is a pure number (balance line)
+                if re.match(r"^[\d.,]+$", nxt):
+                    break
+                # Add to description if it's text
+                if not re.match(r"^\d{2}:\d{2}", nxt):
+                    desc = (desc + " " + nxt).strip()
+                j += 1
+            
+            desc = re.sub(r"\s+", " ", desc).strip()
+            
+            # Parse amount and type
+            amount = 0.0
+            amount_type = "credit"
+            balance = 0.0
+            
+            if len(currency_vals) >= 2:
+                amount = abs(clean_amount(currency_vals[0]))
+                balance = abs(clean_amount(currency_vals[-1]))
+                if "-" in currency_vals[0] or "DB" in line.upper() or "DEBIT" in line.upper():
+                    amount_type = "debit"
+            elif len(currency_vals) == 1:
+                amount = abs(clean_amount(currency_vals[0]))
+                if "-" in currency_vals[0] or "DB" in line.upper():
+                    amount_type = "debit"
+            
+            if amount > 0:
+                if amount_type == "credit":
+                    incoming_total += amount
+                else:
+                    outgoing_total += amount
+                
+                transactions.append({
+                    "transaction_date": tx_date,
+                    "transaction_description": desc,
+                    "transaction_amount": amount,
+                    "amount_type": amount_type,
+                    "transaction_bank": bank_label,
+                    "transaction_balance": balance
+                })
+        
+        i += 1
+    
+    # Fallback: derive closing from last transaction
+    if not closing_balance and transactions:
+        closing_balance = transactions[-1]["transaction_balance"]
+    
+    return {
+        "period": period_val,
+        "initial_balance": initial_balance,
+        "closing_balance": closing_balance,
+        "incoming_transactions": incoming_total,
+        "outgoing_transactions": outgoing_total,
+        "transactions": transactions,
+        "is_smart_parsed": True
+    }
+
 
 def clean_amount(amount_str: str) -> float:
     if not amount_str: 
         return 0.0
     
     # Keep digits, dots, commas, minus
-    clean_str = re.sub(r"[^\d.,-]", "", str(amount_str))
+    clean_str = re.sub(r"[^\d.,-]", "", str(amount_str)).strip()
     
     if not clean_str: 
         return 0.0
 
-    # Handle negative sign usually at start or end
-    is_negative = False
-    if "-" in clean_str:
-        is_negative = True
-        clean_str = clean_str.replace("-", "")
+    # Handle negative sign
+    is_negative = clean_str.startswith("-")
+    clean_str = clean_str.lstrip("-")
 
-    # Normalize Indonesian/EU format: 1.000,00 -> 1000.00
-    # or US/BCA format: 1,000.00 -> 1000.00
-    
+    # Format detection: dot and comma both present
     if "." in clean_str and "," in clean_str:
         if clean_str.find(".") < clean_str.find(","):
-            # Dot first (thousands), Comma second (decimal) -> Mandiri
+            # Indonesian: 1.000.000,50 -> 1000000.50
             val = clean_str.replace(".", "").replace(",", ".")
-            return float(val) * (-1 if is_negative else 1)
         else:
-            # Comma first (thousands), Dot second (decimal) -> BCA
+            # US/BCA: 1,000.50 -> 1000.50
             val = clean_str.replace(",", "")
-            return float(val) * (-1 if is_negative else 1)
-    elif "," in clean_str:
-        # Check if comma is decimal (e.g. ,00 at end)
-        if re.search(r",\d{2}$", clean_str):
-             val = clean_str.replace(",", ".")
-             return float(val) * (-1 if is_negative else 1)
-        else:
-             # Assume comma is thousands
-             val = clean_str.replace(",", "")
-             return float(val) * (-1 if is_negative else 1)
+        return float(val) * (-1 if is_negative else 1)
     
-    # Simple number
-    return float(clean_str) * (-1 if is_negative else 1)
+    elif "," in clean_str:
+        if re.search(r",\d{1,2}$", clean_str):
+            # Comma is decimal separator: 1000,50
+            val = clean_str.replace(",", ".")
+        else:
+            # Comma is thousands separator: 1,000,000
+            val = clean_str.replace(",", "")
+        return float(val) * (-1 if is_negative else 1)
+    
+    elif "." in clean_str:
+        # Dots only: could be Indonesian thousands (20.152.067) or decimal (100.50)
+        parts = clean_str.split(".")
+        if len(parts) > 2:
+            # Multiple dots = thousands separators: 20.152.067
+            val = clean_str.replace(".", "")
+        elif len(parts[-1]) == 2 or len(parts[-1]) == 3:
+            # e.g. 100.50 (decimal) vs 100.000 (thousands)
+            if len(parts[-1]) == 3:
+                # Likely thousands: 100.000
+                val = clean_str.replace(".", "")
+            else:
+                # Likely decimal: 100.50
+                val = clean_str
+        else:
+            val = clean_str.replace(".", "")
+        return float(val) * (-1 if is_negative else 1)
+    
+    # Pure integer
+    try:
+        return float(clean_str) * (-1 if is_negative else 1)
+    except ValueError:
+        return 0.0
 
 def parse_bca(text: str) -> dict:
     lines = [l.strip() for l in text.split("\n") if l.strip()]
