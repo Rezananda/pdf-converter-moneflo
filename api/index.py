@@ -1,7 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import fitz  # PyMuPDF
-from api.parsers import parse_bank_statement, validate_bank_statement, detect_bank
+try:
+    from api.parsers import parse_bank_statement, validate_bank_statement, detect_bank
+except ModuleNotFoundError:
+    from parsers import parse_bank_statement, validate_bank_statement, detect_bank
 import os
 import re
 import traceback
@@ -247,15 +250,105 @@ async def convert_pdf_to_text(
             result["filename"] = file.filename
             return result
         except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=400, detail=f"Gagal melakukan konversi: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Parsing error: {str(e)}")
 
-    except HTTPException as http_exc:
-        raise http_exc
+    except HTTPException:
+        raise
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {repr(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+def categorize_transaction(description: str) -> str:
+
+    """Return a category based on simple keyword matching.
+
+    The mapping is intentionally lightweight – it checks the lower‑cased description
+    for known keywords and returns the first matching category. If nothing matches,
+    'Other' is returned.
+    """
+    desc = description.lower()
+    # Keyword groups for each category
+
+    mapping = {
+        'Food & Beverage': [
+            'restaurant', 'cafe', 'kopi', 'coffee', 'food', 'drink', 'mcdonald', 
+            'burger', 'pizza', 'kfc', 'ayam', 'nasi', 'bakso', 'sate', 'martabak', 
+            'warung', 'jajan', 'kuliner', 'gorengan', 'telor gulu', 'ayojajan', 
+            'bubur', 'roti o', 'roti\'o', 'snack', 'tahu'
+        ],
+        'Transportation': [
+            'taxi', 'uber', 'grab', 'bus', 'train', 'metro', 'fuel', 'bensin', 
+            'pertamina', 'tol', 'parking', 'angkutan', 'ojek'
+        ],
+        'Shopping': [
+            'tokopedia', 'shopee', 'lazada', 'mall', 'store', 'shop', 'grosir', 
+            'supermarket', 'indomaret', 'alfamart', 'e-commerce', 'purchase', 
+            'familymart', 'indoma', 'market', 'idm', 'qris livin', 'edc'
+        ],
+        'Entertainment': [
+            'cinema', 'movie', 'theatre', 'concert', 'ticket', 'spotify', 
+            'netflix', 'gaming', 'hallo', 'event', 'floating market'
+        ],
+        'Utilities': [
+            'pln', 'electric', 'listrik', 'water', 'gas', 'telekom', 'internet', 
+            'telkom', 'pdam', 'utility', 'indihome', 'finnet', 'prepaid'
+        ],
+        'Rent & Housing': [
+            'rent', 'sewa', 'kos', 'apartemen', 'indekos', 'housing', 'property'
+        ],
+        'Medical & Health': [
+            'apotek', 'pharmacy', 'clinic', 'hospital', 'dokter', 'medicine', 
+            'health', 'obat', 'suplemen', 'apotik'
+        ],
+        'Education': [
+            'school', 'university', 'college', 'course', 'kelas', 'tuition', 
+            'education', 'pelatihan', 'bimbel'
+        ],
+        'Transaction': [
+            'transfer', 'payment', 'withdraw', 'setoran', 'deposit', 'pembayaran', 
+            'flazz', 'e-money', 'tapcash', 'biaya admin', 'biaya', 'admin', 'atm', 
+            'trsf', 'bi-fast', 'ftfva', 'ftscy', 'kartu kredit', 'tunai'
+        ],
+    }
+
+    for category, keywords in mapping.items():
+        for kw in keywords:
+            if kw in desc:
+                return category
+    return 'Other'
+
+@app.post("/api/v1/categorize")
+async def categorize_transactions(payload: dict, user: dict = Depends(verify_token)):
+    """Accept the parsed bank‑statement JSON from `/api/v1/convert` and add categories.
+
+    The expected input is the same structure returned by ``/api/v1/convert`` – a dict
+    that contains a ``transactions`` list. Each transaction will receive an additional
+    ``transaction_label`` field with one of the predefined categories.
+    """
+    # Defensive copy – we don't want to mutate the caller's dict unintentionally.
+    result = dict(payload)
+    transactions = result.get('transactions', [])
+    for trx in transactions:
+        if trx.get('amount_type')== 'debit':
+            description = trx.get('transaction_description', '')
+            trx['transaction_label'] = categorize_transaction(description)
+        else:
+            # Jika transaksi kredit (plus/pemasukan), set label ke default Income atau kosongkan
+            trx['transaction_label'] = '' # atau 'Other' / sesuai preferensi DB kamu
+    # Preserve the original list (now enriched) in the response.
+    result['transactions'] = transactions
+    return result
+
+
+
 
 if __name__ == "__main__":
+    import sys
+    import os
     import uvicorn
-    uvicorn.run("api.index:app", host="0.0.0.0", port=8000, reload=True)
+    # When run directly as 'python api/index.py', add the api/ directory to
+    # sys.path so uvicorn's reload subprocess can import 'index' (not 'api.index').
+    api_dir = os.path.dirname(os.path.abspath(__file__))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    uvicorn.run("index:app", host="0.0.0.0", port=8000, reload=True)
