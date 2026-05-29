@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depe
 from fastapi.middleware.cors import CORSMiddleware
 import fitz  # PyMuPDF
 import pytz
+import json
 from datetime import datetime, time
 try:
     from api.parsers import parse_bank_statement, validate_bank_statement, detect_bank
@@ -275,14 +276,33 @@ async def convert_pdf_to_text(
 
 @app.post("/api/v1/categorize")
 async def categorize_transactions(payload: dict, user: dict = Depends(verify_token)):
+    """Accept the parsed bank‑statement JSON from `/api/v1/convert` and add categories."""
+    # Defensif copy agar tidak merusak payload asli
     result = dict(payload)
     transactions = result.get('transactions', [])
+    
+    enriched_transactions = []
+    
     for trx in transactions:
-        if trx.get('amount_type') == 'debit':
-            trx['transaction_label'] = categorize_transaction(trx.get('transaction_description', ''))
-        else:
-            trx['transaction_label'] = ''
-    result['transactions'] = transactions
+        # 🔴 PERBAIKAN: Jika data transaksi datang sebagai string JSON, decode dulu menjadi dict
+        if isinstance(trx, str):
+            try:
+                trx = json.loads(trx)
+            except Exception:
+                # Jika string biasa dan gagal di-parse, lewati atau biarkan apa adanya
+                continue
+                
+        # Pastikan data sekarang sudah berupa dictionary sebelum memanggil .get()
+        if isinstance(trx, dict):
+            if trx.get('amount_type') == 'debit':
+                description = trx.get('transaction_description', '')
+                trx['transaction_label'] = categorize_transaction(description)
+            else:
+                trx['transaction_label'] = ''
+            enriched_transactions.append(trx)
+            
+    # Kembalikan list transaksi yang sudah diperkaya labelnya
+    result['transactions'] = enriched_transactions
     return result
 
 if __name__ == "__main__":
